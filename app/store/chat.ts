@@ -352,13 +352,13 @@ export const useChatStore = createPersistStore(
         return session;
       },
 
-      onNewMessage(message: ChatMessage) {
-        get().updateCurrentSession((session) => {
+      onNewMessage(message: ChatMessage, targetSession: ChatSession) {
+        get().updateTargetSession(targetSession, (session) => {
           session.messages = session.messages.concat();
           session.lastUpdate = Date.now();
         });
         get().updateStat(message);
-        get().summarizeSession();
+        get().summarizeSession(false, targetSession);
       },
 
       async onUserInput(content: string, attachImages?: string[]) {
@@ -372,22 +372,16 @@ export const useChatStore = createPersistStore(
 
         if (attachImages && attachImages.length > 0) {
           mContent = [
-            {
-              type: "text",
-              text: userContent,
-            },
+            ...(userContent
+              ? [{ type: "text" as const, text: userContent }]
+              : []),
+            ...attachImages.map((url) => ({
+              type: "image_url" as const,
+              image_url: { url },
+            })),
           ];
-          mContent = mContent.concat(
-            attachImages.map((url) => {
-              return {
-                type: "image_url",
-                image_url: {
-                  url: url,
-                },
-              };
-            }),
-          );
         }
+
         let userMessage: ChatMessage = createMessage({
           role: "user",
           content: mContent,
@@ -434,7 +428,7 @@ export const useChatStore = createPersistStore(
             botMessage.streaming = false;
             if (message) {
               botMessage.content = message;
-              get().onNewMessage(botMessage);
+              get().onNewMessage(botMessage, session);
             }
             ChatControllerPool.remove(session.id, botMessage.id);
           },
@@ -604,9 +598,12 @@ export const useChatStore = createPersistStore(
         });
       },
 
-      summarizeSession(refreshTitle: boolean = false) {
+      summarizeSession(
+        refreshTitle: boolean = false,
+        targetSession: ChatSession,
+      ) {
         const config = useAppConfig.getState();
-        const session = get().currentSession();
+        const session = targetSession;
         const modelConfig = session.mask.modelConfig;
         // skip summarize when using dalle3?
         if (isDalle3(modelConfig.model)) {
@@ -655,13 +652,15 @@ export const useChatStore = createPersistStore(
               stream: false,
               providerName,
             },
-            onFinish(message) {
-              if (!isValidMessage(message)) return;
-              get().updateCurrentSession(
-                (session) =>
-                  (session.topic =
-                    message.length > 0 ? trimTopic(message) : DEFAULT_TOPIC),
-              );
+            onFinish(message, responseRes) {
+              if (responseRes?.status === 200) {
+                get().updateTargetSession(
+                  session,
+                  (session) =>
+                    (session.topic =
+                      message.length > 0 ? trimTopic(message) : DEFAULT_TOPIC),
+                );
+              }
             },
           });
         }
@@ -675,7 +674,7 @@ export const useChatStore = createPersistStore(
 
         const historyMsgLength = countMessages(toBeSummarizedMsgs);
 
-        if (historyMsgLength > modelConfig?.max_tokens ?? 4000) {
+        if (historyMsgLength > (modelConfig?.max_tokens || 4000)) {
           const n = toBeSummarizedMsgs.length;
           toBeSummarizedMsgs = toBeSummarizedMsgs.slice(
             Math.max(0, n - modelConfig.historyMessageCount),
@@ -721,21 +720,19 @@ export const useChatStore = createPersistStore(
             onUpdate(message) {
               session.memoryPrompt = message;
             },
-            onFinish(message) {
-              console.log("[Memory] ", message);
-              get().updateCurrentSession((session) => {
-                session.lastSummarizeIndex = lastSummarizeIndex;
-                session.memoryPrompt = message; // Update the memory prompt for stored it in local storage
-              });
+            onFinish(message, responseRes) {
+              if (responseRes?.status === 200) {
+                console.log("[Memory] ", message);
+                get().updateTargetSession(session, (session) => {
+                  session.lastSummarizeIndex = lastSummarizeIndex;
+                  session.memoryPrompt = message; // Update the memory prompt for stored it in local storage
+                });
+              }
             },
             onError(err) {
               console.error("[Summarize] ", err);
             },
           });
-        }
-
-        function isValidMessage(message: any): boolean {
-          return typeof message === "string" && !message.startsWith("```json");
         }
       },
 
@@ -752,7 +749,16 @@ export const useChatStore = createPersistStore(
         updater(sessions[index]);
         set(() => ({ sessions }));
       },
-
+      updateTargetSession(
+        targetSession: ChatSession,
+        updater: (session: ChatSession) => void,
+      ) {
+        const sessions = get().sessions;
+        const index = sessions.findIndex((s) => s.id === targetSession.id);
+        if (index < 0) return;
+        updater(sessions[index]);
+        set(() => ({ sessions }));
+      },
       async clearAllData() {
         await indexedDBStorage.clear();
         localStorage.clear();
